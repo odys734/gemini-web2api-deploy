@@ -62,6 +62,13 @@ DEFAULT_CONFIG = {
     "proxy": None,
     "api_keys": [],
     "temporary_chats": False,
+    "tts_base_url": "https://api.openai.com/v1",
+    "tts_api_key": None,
+    "tts_model": "gpt-4o-mini-tts",
+    "tts_voice": "en-IN-NeerjaExpressiveNeural",
+    "tts_format": "mp3",
+    "tts_provider": "edge",
+    "tts_edge_bin": None,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
@@ -652,6 +659,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_bytes(self, body, content_type="application/octet-stream", status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _authorized(self):
         keys = CONFIG.get("api_keys") or []
         if not keys:
@@ -693,7 +708,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self._handle_google_models_list()
             elif self.path == "/":
                 self.send_json({"status": "ok", "version": __version__,
-                                "models": list(MODELS.keys())})
+                                "models": list(MODELS.keys()),
+                                "tts": {
+                                    "endpoint": "/v1/audio/speech",
+                                    "model": CONFIG.get("tts_model"),
+                                    "voice": CONFIG.get("tts_voice"),
+                                }})
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -709,6 +729,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             body = self._read_request_body()
             if self.path == "/v1/chat/completions":
                 self.handle_chat(body)
+            elif self.path == "/v1/audio/speech":
+                self.handle_speech(body)
             elif self.path == "/v1/responses":
                 self.handle_responses(body)
             elif ":streamGenerateContent" in self.path:
@@ -991,6 +1013,160 @@ class GeminiHandler(BaseHTTPRequestHandler):
             })
         self.send_json({"models": models})
 
+    def handle_speech(self, body: bytes):
+        """OpenAI-compatible /v1/audio/speech.
+
+        Free/local backends (no API key):
+          tts_provider = "edge"  -> Microsoft Edge neural voices via edge-tts (default)
+        Proxied backends (API key required):
+          tts_provider = "openai" -> {tts_base_url}/audio/speech
+        """
+        req = json.loads(body)
+        text = (req.get("input") or "").strip()
+        if not text:
+            self.send_json({"error": {"message": "empty input"}}, 400)
+            return
+
+        provider = (CONFIG.get("tts_provider") or "edge").lower()
+        if provider == "edge":
+            self._speech_edge(req, text)
+        else:
+            self._speech_openai(req, text)
+
+    def _speech_edge(self, req, text: str):
+        """Free neural TTS using the edge-tts CLI (no API key)."""
+        import shutil
+        import subprocess
+        import tempfile
+        import os as _os
+
+        voice = req.get("voice") or CONFIG.get("tts_voice") or "en-IN-NeerjaExpressiveNeural"
+        # Map common OpenAI voice names to nice Edge female voices.
+        aliases = {
+            "shimmer": "en-IN-NeerjaExpressiveNeural",
+            "coral": "en-IN-NeerjaExpressiveNeural",
+            "nova": "en-IN-NeerjaNeural",
+            "alloy": "en-IN-NeerjaNeural",
+            "fable": "hi-IN-SwaraNeural",
+            "sweetie": "en-IN-NeerjaExpressiveNeural",
+            "default": "en-IN-NeerjaNeural",
+        }
+        voice = aliases.get(voice.lower(), voice)
+
+        rate = req.get("rate")
+        if rate is None and req.get("speed") is not None:
+            try:
+                spd = float(req["speed"])
+                pct = int(round((spd - 1.0) * 100))
+                if pct != 0:
+                    rate = f"{pct:+d}%"
+            except (TypeError, ValueError):
+                rate = None
+        pitch = req.get("pitch")
+
+        exe = CONFIG.get("tts_edge_bin") or shutil.which("edge-tts")
+        if not exe:
+            self.send_json({"error": {"message": "edge-tts not installed on server"}}, 502)
+            return
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        tmp.close()
+        cmd = [exe, "--voice", voice, "--text", text, "--write-media", tmp.name]
+        if rate:
+            cmd += ["--rate", str(rate)]
+        if pitch:
+            cmd += ["--pitch", str(pitch)]
+        try:
+            proc = subprocess.run(cmd, capture_output=True,
+                                  timeout=CONFIG["request_timeout_sec"])
+            if proc.returncode != 0 or not _os.path.exists(tmp.name):
+                msg = proc.stderr.decode("utf-8", errors="replace")[:300]
+                self.send_json({"error": {"message": f"edge-tts failed: {msg}"}}, 502)
+                return
+            with open(tmp.name, "rb") as f:
+                out = f.read()
+        except subprocess.TimeoutExpired:
+            self.send_json({"error": {"message": "edge-tts timed out"}}, 504)
+            return
+        except Exception as e:
+            self.send_json({"error": {"message": f"edge-tts error: {e}"}}, 502)
+            return
+        finally:
+            try:
+                _os.unlink(tmp.name)
+            except Exception:
+                pass
+
+        self.send_bytes(out, "audio/mpeg")
+
+    def _speech_openai(self, req, text: str):
+        """OpenAI-compatible /v1/audio/speech -> proxied to the configured TTS provider."""
+        model = req.get("model") or CONFIG.get("tts_model") or "gpt-4o-mini-tts"
+        voice = req.get("voice") or CONFIG.get("tts_voice") or "shimmer"
+        fmt = req.get("response_format") or CONFIG.get("tts_format") or "mp3"
+        speed = req.get("speed")
+
+        payload = {"model": model, "voice": voice, "input": text, "response_format": fmt}
+        if speed is not None:
+            try:
+                payload["speed"] = float(speed)
+            except (TypeError, ValueError):
+                pass
+        if req.get("instructions"):
+            payload["instructions"] = req["instructions"]
+
+        base = (CONFIG.get("tts_base_url") or "https://api.openai.com/v1").rstrip("/")
+        if base.endswith("/audio/speech"):
+            url = base
+        elif base.endswith("/v1"):
+            url = base + "/audio/speech"
+        else:
+            url = base + "/v1/audio/speech"
+
+        key = CONFIG.get("tts_api_key")
+        headers = {"Content-Type": "application/json", "Accept": "*/*"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+
+        try:
+            data = json.dumps(payload).encode()
+            proxy = CONFIG.get("proxy")
+            if HAS_HTTPX:
+                with httpx.Client(timeout=CONFIG["request_timeout_sec"],
+                                  proxy=proxy) as client:
+                    resp = client.post(url, content=data, headers=headers)
+                    status = resp.status_code
+                    out = resp.content
+                    ctype = resp.headers.get("Content-Type", "audio/mpeg")
+            else:
+                reqobj = urllib.request.Request(url, data=data, headers=headers, method="POST")
+                ctx = ssl.create_default_context()
+                if proxy:
+                    opener = urllib.request.build_opener(
+                        urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                        urllib.request.HTTPSHandler(context=ctx))
+                    respobj = opener.open(reqobj, timeout=CONFIG["request_timeout_sec"])
+                else:
+                    respobj = urllib.request.urlopen(reqobj, context=ctx,
+                                                     timeout=CONFIG["request_timeout_sec"])
+                status = respobj.status
+                out = respobj.read()
+                ctype = respobj.headers.get("Content-Type", "audio/mpeg")
+        except Exception as e:
+            self.send_json({"error": {"message": f"tts upstream error: {e}"}}, 502)
+            return
+
+        if status >= 400:
+            try:
+                self.send_json(json.loads(out.decode("utf-8", errors="replace")), status)
+            except Exception:
+                self.send_json({"error": {"message": f"tts upstream {status}"}}, status)
+            return
+
+        if "audio" not in ctype:
+            ctype = "audio/mpeg"
+        self.send_bytes(out, ctype)
+
     def _handle_google_generate(self, body: bytes, stream: bool):
         """Handle Google native generateContent / streamGenerateContent."""
         req = json.loads(body)
@@ -1096,6 +1272,8 @@ def main():
     print(f"  Retry:     {CONFIG['retry_attempts']}x / {CONFIG['retry_delay_sec']}s")
     print(f"  BL:        {CONFIG['gemini_bl']}")
     print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
+    print(f"  TTS:       /v1/audio/speech -> provider={CONFIG.get('tts_provider')} "
+          f"(voice={CONFIG.get('tts_voice')}, key={'yes' if CONFIG.get('tts_api_key') else 'none'})")
     print()
     try:
         server.serve_forever()
